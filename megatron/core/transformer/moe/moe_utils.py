@@ -724,7 +724,8 @@ def apply_router_token_dropping(
         final_map = torch.logical_and(routing_map, capacity_mask)
         final_probs = routing_probs * final_map
 
-    return final_probs, final_map
+    num_dropped_tokens = routing_map.sum() - final_map.sum()
+    return final_probs, final_map, num_dropped_tokens
 
 
 def save_to_aux_losses_tracker(

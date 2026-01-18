@@ -527,7 +527,7 @@ class TopKRouter(Router):
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
-            probs, routing_map = apply_router_token_dropping(
+            probs, routing_map, dropped_tokens = apply_router_token_dropping(
                 probs,
                 routing_map,
                 router_topk=self.topk,
@@ -535,6 +535,25 @@ class TopKRouter(Router):
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
+            # Logging dropped tokens.
+            if self.training and self.is_aux_loss_enabled():
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                
+                # Calculate drop rate: dropped_tokens / (total_tokens * topk)
+                # logits shape is [num_tokens, num_experts] (flattened) or [seq_len, bsz, num_experts]
+                # In routing(), logits is reshaped to [-1, num_experts], so probs.shape[0] is total tokens.
+                total_tokens = probs.shape[0]
+                dropped_rate = dropped_tokens / (total_tokens * self.topk)
+                
+                save_to_aux_losses_tracker(
+                    "dropped_token_rate",
+                    dropped_rate,
+                    self.layer_number,
+                    num_layers,
+                    avg_group=self.tp_dp_cp_group,
+                )
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
