@@ -382,7 +382,18 @@ class HFToDCPConverter:
         if not hasattr(self.args, 'num_experts'):
             self.args.num_experts = hf_config.get('num_local_experts', 0)
         if not hasattr(self.args, 'moe_layer_freq'):
-            self.args.moe_layer_freq = hf_config.get('moe_layer_freq', [0] * self.args.num_layers)
+            # Convert HF's first_k_dense_replace to Megatron's moe_layer_freq list
+            # first_k_dense_replace = N means first N layers are dense, rest are MoE
+            first_k_dense = hf_config.get('first_k_dense_replace', 0)
+            if first_k_dense > 0 and self.args.num_experts > 0:
+                # [0, 0, ..., 1, 1, ...] - first_k_dense zeros, then ones
+                self.args.moe_layer_freq = [0] * first_k_dense + [1] * (self.args.num_layers - first_k_dense)
+            elif self.args.num_experts > 0:
+                # All layers are MoE
+                self.args.moe_layer_freq = [1] * self.args.num_layers
+            else:
+                # No MoE
+                self.args.moe_layer_freq = [0] * self.args.num_layers
     
     def _convert_state_dict(self, hf_state_dict):
         """Convert HF state dict to Megatron format."""
@@ -518,28 +529,34 @@ class HFToDCPConverter:
                 megatron_state_dict[f'{prefix}.{megatron_subkey}'] = hf_state_dict[f'{hf_prefix}.{hf_subkey}']
     
     def _save_dcp(self, state_dict):
-        """Save state dict in DCP format."""
-        # For simplicity, save as torch format that can be loaded by Megatron
-        # A proper DCP save would use torch.distributed.checkpoint
-        
-        # Save as simple torch checkpoint for now
-        ckpt_path = os.path.join(self.dst, 'model_weights.pt')
-        torch.save(state_dict, ckpt_path)
-        logging.info(f"Saved model weights to {ckpt_path}")
-        
-        # Also save in DCP format if torch DCP is available
+        """Save state dict in torch_dist format (compatible with Megatron --ckpt-format torch_dist)."""
         try:
-            from torch.distributed.checkpoint import save_state_dict
-            from torch.distributed.checkpoint.filesystem import FileSystemWriter
+            # Initialize fake distributed environment for single-process saving
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend='gloo',
+                    init_method='tcp://localhost:29500',
+                    world_size=1,
+                    rank=0
+                )
             
-            dcp_path = os.path.join(self.dst, 'dcp')
-            os.makedirs(dcp_path, exist_ok=True)
+            from megatron.core import dist_checkpointing
             
-            writer = FileSystemWriter(dcp_path)
-            save_state_dict(state_dict, writer)
-            logging.info(f"Saved DCP checkpoint to {dcp_path}")
+            os.makedirs(self.dst, exist_ok=True)
+            
+            # dist_checkpointing.save expects plain tensors for non-sharded single-rank save
+            dist_checkpointing.save(
+                sharded_state_dict=state_dict,
+                checkpoint_dir=self.dst,
+            )
+            logging.info(f"Saved torch_dist checkpoint to {self.dst}")
         except Exception as e:
-            logging.warning(f"Could not save in DCP format: {e}")
+            # Fallback to simple torch checkpoint
+            logging.warning(f"Could not save in torch_dist format: {e}") 
+            logging.info("Falling back to torch.save format...")
+            ckpt_path = os.path.join(self.dst, 'model_weights.pt')
+            torch.save(state_dict, ckpt_path)
+            logging.info(f"Saved model weights to {ckpt_path}")
     
     def _save_common(self):
         """Save common.pt with args."""
@@ -565,48 +582,6 @@ def parse_args():
         required=True,
         help='Path to save Megatron DCP checkpoint',
     )
-    parser.add_argument(
-        '--num-layers',
-        type=int,
-        default=None,
-        help='Number of transformer layers (read from config.json if not specified)',
-    )
-    parser.add_argument(
-        '--hidden-size',
-        type=int,
-        default=None,
-        help='Hidden size (read from config.json if not specified)',
-    )
-    parser.add_argument(
-        '--num-attention-heads',
-        type=int,
-        default=None,
-        help='Number of attention heads (read from config.json if not specified)',
-    )
-    parser.add_argument(
-        '--num-query-groups',
-        type=int,
-        default=None,
-        help='Number of query groups for GQA (read from config.json if not specified)',
-    )
-    parser.add_argument(
-        '--kv-channels',
-        type=int,
-        default=None,
-        help='Head dimension (computed from hidden_size/num_heads if not specified)',
-    )
-    parser.add_argument(
-        '--vocab-size',
-        type=int,
-        default=None,
-        help='Vocabulary size (read from config.json if not specified)',
-    )
-    parser.add_argument(
-        '--ffn-hidden-size',
-        type=int,
-        default=None,
-        help='FFN hidden size (read from config.json if not specified)',
-    )
     
     return parser.parse_args()
 
@@ -619,27 +594,11 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
     
-    # Build megatron args dict
-    megatron_args = {}
-    if args.num_layers is not None:
-        megatron_args['num_layers'] = args.num_layers
-    if args.hidden_size is not None:
-        megatron_args['hidden_size'] = args.hidden_size
-    if args.num_attention_heads is not None:
-        megatron_args['num_attention_heads'] = args.num_attention_heads
-    if args.num_query_groups is not None:
-        megatron_args['num_query_groups'] = args.num_query_groups
-    if args.kv_channels is not None:
-        megatron_args['kv_channels'] = args.kv_channels
-    if args.vocab_size is not None:
-        megatron_args['vocab_size'] = args.vocab_size
-    if args.ffn_hidden_size is not None:
-        megatron_args['ffn_hidden_size'] = args.ffn_hidden_size
-    
+    # All model args are read from HF config.json automatically
     converter = HFToDCPConverter(
         hf_ckpt_path=args.checkpoint_path,
         dst=args.target_path,
-        megatron_args=megatron_args,
+        megatron_args={},
     )
     
     converter.convert()
