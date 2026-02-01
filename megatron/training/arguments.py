@@ -3727,4 +3727,12 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--sft-neat-packing', action='store_true',
+                       help='Enable neat packing for SFT training. This uses first-fit '
+                       'decreasing bin packing algorithm to pack multiple shorter sequences '
+                       'into single bins, improving GPU utilization.')
+    group.add_argument('--sft-max-sequences-per-pack', type=int, default=None,
+                       help='Maximum number of sequences to pack into a single bin when '
+                       'using --sft-neat-packing. Default is None (unlimited).')
     return parser
+

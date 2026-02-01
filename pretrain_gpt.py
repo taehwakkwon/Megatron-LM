@@ -32,7 +32,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import SFTDataset, NeatSFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -283,7 +283,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
     if args.sft:
-        dataset_type = SFTDataset
+        if getattr(args, 'sft_neat_packing', False):
+            dataset_type = NeatSFTDataset
+            print_rank_0("> using NeatSFTDataset with first-fit decreasing bin packing...")
+        else:
+            dataset_type = SFTDataset
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

@@ -44,8 +44,17 @@ class SFTLowLevelDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+    def __getitem__(self, idx: int) -> dict:
+        """Return sample with messages and optional tools.
+        
+        Returns:
+            dict: {"messages": [...], "tools": [...] or None}
+        """
+        item = self.dataset[idx]
+        return {
+            "messages": item["messages"],
+            "tools": item.get("tools", None),
+        }
 
 
 class SFTDataset(MegatronDataset):
@@ -93,7 +102,19 @@ class SFTDataset(MegatronDataset):
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
+        # Get sample data (may contain messages and optional tools)
+        sample_data = self.dataset[int(self.indices[idx % len(self.indices)])]
+        
+        # Handle both dict format {"messages": [...], "tools": [...]} 
+        # and legacy list format (just messages)
+        if isinstance(sample_data, dict):
+            merged_conversations = sample_data["messages"]
+            tools = sample_data.get("tools", None)
+        else:
+            # Legacy format: sample_data is just the messages list
+            merged_conversations = sample_data
+            tools = None
+            
         split_conversations = self._split_conversations(merged_conversations)
 
         def extend_with_padding(tokens, targets, positions, pad_len):
@@ -111,7 +132,7 @@ class SFTDataset(MegatronDataset):
         for conversation in split_conversations:
 
             tokens, targets = tokenizer.tokenize_conversation(
-                conversation, return_target=True, add_generation_prompt=False
+                conversation, return_target=True, add_generation_prompt=False, tools=tools
             )
 
             tokens_list = tokens.tolist()
@@ -201,3 +222,214 @@ class SFTDataset(MegatronDataset):
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
         }
+
+
+class NeatSFTDataset(SFTDataset):
+    """SFT Dataset with neat packing support using first-fit decreasing algorithm.
+    
+    This dataset packs multiple shorter sequences into single bins to improve GPU
+    utilization by reducing padding waste. All samples are pre-processed and packed
+    during initialization.
+    
+    The max_sequences_per_pack value is read from global args (--sft-max-sequences-per-pack).
+    
+    Args:
+        dataset: Low-level dataset
+        dataset_path: Path to the dataset
+        indices: Sample indices
+        num_samples: Number of samples
+        index_split: Train/valid/test split
+        config: GPT dataset configuration
+    """
+
+    def __init__(
+        self,
+        dataset: LowLevelDataset,
+        dataset_path: Optional[str],
+        indices: np.ndarray,
+        num_samples: Optional[int],
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        
+        # Get max_sequences_per_pack from global args
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            self.max_sequences_per_pack = getattr(args, 'sft_max_sequences_per_pack', None)
+        except Exception:
+            self.max_sequences_per_pack = None
+        
+        self._packed_samples = None
+        self._packing_info = None
+        self._dataset_path = dataset_path
+        
+        # Generate cache path
+        self._cache_path = self._get_cache_path()
+        
+        # Try to load from cache, otherwise pack and cache
+        if not self._load_from_cache():
+            self._initialize_packing()
+            self._save_to_cache()
+
+    def _get_cache_path(self) -> Optional[str]:
+        """Generate cache file path based on dataset configuration."""
+        import hashlib
+        import os
+        
+        if self._dataset_path is None:
+            return None
+        
+        # Create a hash of the configuration that affects packing
+        config_str = f"{self._dataset_path}:{len(self.indices)}:{self.config.sequence_length}:{self.max_sequences_per_pack}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:12]
+        
+        # Cache directory next to dataset
+        cache_dir = os.path.join(os.path.dirname(self._dataset_path), ".sft_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Include rank in cache path for distributed training
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        except Exception:
+            rank = 0
+        
+        cache_file = f"packed_sft_{config_hash}_rank{rank}.pt"
+        return os.path.join(cache_dir, cache_file)
+
+    def _load_from_cache(self) -> bool:
+        """Try to load packed samples from cache. Returns True if successful."""
+        import os
+        
+        if self._cache_path is None or not os.path.exists(self._cache_path):
+            return False
+        
+        try:
+            cache_data = torch.load(self._cache_path, weights_only=False)
+            self._packed_samples = cache_data['packed_samples']
+            self._packing_info = cache_data.get('packing_info')
+            print(f"[NeatSFTDataset] Loaded {len(self._packed_samples)} packed samples from cache: {self._cache_path}")
+            return True
+        except Exception as e:
+            print(f"[NeatSFTDataset] Failed to load cache: {e}")
+            return False
+
+    def _save_to_cache(self) -> None:
+        """Save packed samples to cache."""
+        if self._cache_path is None or self._packed_samples is None:
+            return
+        
+        try:
+            cache_data = {
+                'packed_samples': self._packed_samples,
+                'packing_info': self._packing_info,
+            }
+            torch.save(cache_data, self._cache_path)
+            print(f"[NeatSFTDataset] Saved {len(self._packed_samples)} packed samples to cache: {self._cache_path}")
+        except Exception as e:
+            print(f"[NeatSFTDataset] Failed to save cache: {e}")
+
+    def _initialize_packing(self) -> None:
+        """Pre-process and pack all samples."""
+        from megatron.training.datasets.sft_packing import SFTNeatPacker
+        
+        # Tokenize all samples first
+        all_samples = []
+        for idx in range(len(self.indices)):
+            sample = self._tokenize_single_sample(idx)
+            if sample is not None:
+                all_samples.append(sample)
+        
+        if not all_samples:
+            self._packed_samples = []
+            return
+        
+        # Create packer and pack samples
+        tokenizer = self.config.tokenizer
+        packer = SFTNeatPacker(
+            bin_size=self.config.sequence_length,
+            pad_token=tokenizer.pad,
+            max_sequences_per_bin=self.max_sequences_per_pack,
+        )
+        
+        self._packed_samples, self._packing_info = packer.pack_samples(all_samples)
+
+    def _tokenize_single_sample(self, idx: int) -> Optional[Dict[str, Any]]:
+        """Tokenize a single sample without packing."""
+        tokenizer = self.config.tokenizer
+        pack_length = self.config.sequence_length
+        
+        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
+        split_conversations = self._split_conversations(merged_conversations)
+        
+        if not split_conversations:
+            return None
+        
+        # Only use the first conversation for neat packing
+        # (each sample = one conversation, packer combines multiple)
+        conversation = split_conversations[0]
+        
+        tokens, targets = tokenizer.tokenize_conversation(
+            conversation, return_target=True, add_generation_prompt=False
+        )
+        
+        tokens_list = tokens.tolist()
+        targets_list = targets.tolist()
+        
+        eod = tokenizer.eod
+        pad = tokenizer.pad
+        
+        # Add EOD if not present
+        if tokens_list[-1] != eod:
+            tokens_list.append(eod)
+            targets_list.append(eod)
+        
+        # Truncate if too long
+        if len(tokens_list) > pack_length:
+            tokens_list = tokens_list[:pack_length - 1] + [eod]
+            targets_list = targets_list[:pack_length - 1] + [eod]
+        
+        # Create loss mask
+        loss_mask = [1.0] * len(tokens_list)
+        for i, t in enumerate(targets_list):
+            if t == pad or t == IGNORE_INDEX:
+                loss_mask[i] = 0.0
+        
+        return {
+            'tokens': torch.tensor(tokens_list, dtype=torch.int64),
+            'labels': torch.tensor(targets_list, dtype=torch.int64),
+            'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
+        }
+
+    def __len__(self) -> int:
+        """Return number of packed bins."""
+        if self._packed_samples is None:
+            return 0
+        return len(self._packed_samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get a packed sample by index."""
+        if self._packed_samples is None or idx >= len(self._packed_samples):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+        
+        packed_sample = self._packed_samples[idx]
+        
+        # Shift labels for next-token prediction
+        tokens = packed_sample['tokens']
+        labels = packed_sample['labels']
+        
+        # For training, labels should be shifted by 1 relative to input
+        # input_ids = tokens[:-1], labels = tokens[1:]
+        input_ids = tokens.clone()
+        labels_shifted = labels.clone()
+        
+        return {
+            'tokens': input_ids,
+            'labels': labels_shifted,
+            'loss_mask': packed_sample['loss_mask'],
+            'position_ids': packed_sample['position_ids'],
+            'cu_seqlens': packed_sample['cu_seqlens'],
+            'max_seqlen': packed_sample['max_seqlen'],
+        }
+
