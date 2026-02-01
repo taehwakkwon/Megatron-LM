@@ -2,6 +2,7 @@
 
 """SFT tokenizer."""
 from typing import Dict, List, Union
+import json
 import numpy as np
 
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
@@ -58,6 +59,35 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "auto":
+            # Use tokenizer's built-in chat_template
+            # This is the recommended approach for most HuggingFace models
+            if not hasattr(tokenizer, 'chat_template') or tokenizer.chat_template is None:
+                raise ValueError(
+                    "prompt_format='auto' requires tokenizer to have a chat_template. "
+                    "Please use a specific prompt format or ensure the tokenizer has a chat_template."
+                )
+            
+            # Determine pad token
+            if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+                pad_token = tokenizer.pad_token_id
+            else:
+                pad_token = tokenizer.eos_token_id
+            
+            # Detect assistant prefix length (approximate based on common patterns)
+            # Most models use 3-4 tokens for assistant prefix
+            assistant_prefix_len = 4  # Safe default
+            
+            # Detect if tokenizer has BOS
+            has_bos = hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None
+            
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=assistant_prefix_len,
+                pad_token_id=pad_token,
+                custom_chat_template=None,  # Use tokenizer's built-in template
+                has_bos=has_bos,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
@@ -65,32 +95,46 @@ class SFTTokenizer(MegatronLegacyTokenizer):
 
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool,
+        tools: List[Dict] = None,
     ):
         """Convert a conversation to tokens.
 
         Args:
-            conversation (List[Dict]): Sequence of system/user/assistant messages.
-                Must be in the following format:
+            conversation (List[Dict]): Sequence of system/user/assistant/tool messages.
+                Supports tool_calls in assistant messages and tool responses.
+                Format:
                 [
                     {"role": "system", "content": "something"},
                     {"role": "user", "content": "something1"},
                     {"role": "assistant", "content": "something2"},
+                    {"role": "assistant", "tool_calls": [{"function": {...}}]},
+                    {"role": "tool", "content": "..."},
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            tools (List[Dict], optional): Tool definitions for function calling.
         """
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
+        # Build kwargs for apply_chat_template
+        template_kwargs = {
+            "tokenize": True,
+            "add_generation_prompt": add_generation_prompt,
+            "return_assistant_token_mask": False,
+            "return_tensors": "np",
+            "chat_template": self._prompt_config.custom_chat_template,
+        }
+        
+        # Add tools if provided
+        if tools is not None:
+            template_kwargs["tools"] = tools
+
         tokens = self._tokenizer.apply_chat_template(
             conversation,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_token_mask=False,
-            return_tensors="np",
-            chat_template=self._prompt_config.custom_chat_template,
+            **template_kwargs,
         )[0]
 
         if not return_target:
@@ -102,10 +146,10 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         idx = 0
         for turn_idx, turn in enumerate(conversation):
             
-            if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
-                raise ValueError(f"empty assistant turn in conversation: {conversation}.")
-            if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() == "user"
+            # Skip empty content check for tool_calls (they may not have content)
+            if turn["role"].lower() == "assistant" and "tool_calls" not in turn:
+                if "content" not in turn or len(turn.get("content", "")) == 0:
+                    raise ValueError(f"empty assistant turn in conversation: {conversation}.")
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
@@ -118,13 +162,17 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             turn_len = len(turn_tokens)
 
             role = turn["role"].lower()
-            if role in ("system", "user"):
+            has_tool_calls = "tool_calls" in turn
+            
+            if role in ("system", "user", "tool", "ipython"):
+                # Mask system, user, and tool response tokens
                 target[idx : idx + turn_len] = IGNORE_INDEX
-            elif role == "assistant":
+            elif role == "assistant" or has_tool_calls:
+                # Learn assistant responses (including tool_calls)
                 if self._prompt_config.assistant_prefix_len > 0:
                     target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
             else:
-                raise ValueError(f"Wrong role value.")
+                raise ValueError(f"Unsupported role: {role}")
 
             assert np.allclose(
                 tokens[idx : idx + turn_len], turn_tokens
@@ -136,11 +184,18 @@ class SFTTokenizer(MegatronLegacyTokenizer):
 
         return tokens, target
 
-    def tokenize(self, text: Union[str, List[Dict]]):
-        """Tokenize conversation or string input."""
+    def tokenize(self, text: Union[str, List[Dict]], tools: List[Dict] = None):
+        """Tokenize conversation or string input.
+        
+        Args:
+            text: Either a string or a conversation list
+            tools: Optional tool definitions for function calling
+        """
         if isinstance(text, list):
             # This code path is used by the inference code currently.
-            return self.tokenize_conversation(text, return_target=False, add_generation_prompt=True).tolist()
+            return self.tokenize_conversation(
+                text, return_target=False, add_generation_prompt=True, tools=tools
+            ).tolist()
 
         return self._encode(text)
 

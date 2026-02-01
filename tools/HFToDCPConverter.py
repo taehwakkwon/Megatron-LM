@@ -279,8 +279,20 @@ class HFToDCPConverter:
             os.makedirs(dst)
         
         # Build args namespace
+        self.args = self._build_args(megatron_args)
+    
+    def _build_args(self, megatron_args):
+        """Build args namespace from dictionary."""
         from argparse import Namespace
-        self.args = Namespace(**megatron_args)    
+        args = Namespace(**megatron_args)
+        
+        # Set defaults if not provided
+        if not hasattr(args, 'kv_channels'):
+            args.kv_channels = args.hidden_size // args.num_attention_heads
+        if not hasattr(args, 'num_query_groups'):
+            args.num_query_groups = args.num_attention_heads  # Default: no GQA
+        
+        return args
     
     def load_hf_weights(self):
         """Load weights from HuggingFace checkpoint."""
