@@ -1202,3 +1202,123 @@ class TestDeferredGlobalAuxLoss:
             _GlobalAuxLossInBackward.backward = backward
             clear_aux_losses_tracker()
             del container
+
+
+def _global_aux_loss_trace(router, routing_maps, defer, monkeypatch):
+    """Run the global aux loss of ``router`` on ``routing_maps`` as consecutive micro-batches of
+    one step (all forwards, then backward in forward order). ``defer[k]`` launches micro-batch k on
+    the deferred path; otherwise it takes the synchronous path, as a CUDA-graph warmup call does.
+    Returns the averaged tokens per expert each loss read and each micro-batch's score gradient."""
+    from megatron.core.transformer.moe import router as router_module
+
+    # A deferred loss runs in backward, so key the averages by micro-batch (score storage).
+    averages = {}
+    loss_func = router_module.switch_load_balancing_loss_func
+
+    def spy(*args, **kwargs):
+        averages[kwargs["probs"].data_ptr()] = kwargs["tokens_per_expert"].detach().clone()
+        return loss_func(*args, **kwargs)
+
+    monkeypatch.setattr(router_module, "switch_load_balancing_loss_func", spy)
+    clear_aux_losses_tracker()
+    router.reset_global_aux_loss_tracker()
+    rank = torch.distributed.get_rank()
+    scores, outputs = [], []
+    for k, (routing_map, deferred) in enumerate(zip(routing_maps, defer)):
+        generator = torch.Generator(device="cuda").manual_seed(100 * k + rank)
+        score = torch.rand(routing_map.shape, device="cuda", generator=generator)
+        score.requires_grad_(True)
+        if deferred:
+            with router.defer_global_aux_loss():
+                probs = router._apply_global_aux_loss(score * 1.0, score, routing_map)
+                output = router.finish_deferred_global_aux_loss(probs)
+        else:
+            output = router._apply_global_aux_loss(score * 1.0, score, routing_map)
+        scores.append(score)
+        outputs.append(output)
+    for output in outputs:
+        output.sum().backward()
+    router.reset_global_aux_loss_tracker()
+    monkeypatch.undo()
+    grads = [score.grad.clone() for score in scores]
+    return [averages[score.data_ptr()] for score in scores], grads
+
+
+class TestDeferredGlobalAuxLossAccumulation:
+    """The deferred global aux loss accumulates the global counts exactly as the synchronous path
+    does: above the fp32 exact-integer range, and when synchronous calls are mixed into the step."""
+
+    def teardown_method(self, method):
+        clear_aux_losses_tracker()
+        Utils.destroy_model_parallel()
+
+    def _router(self, num_experts):
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            cp_size=1,
+            num_moe_experts=num_experts,
+            moe_router_topk=1,
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=1.0,
+        )
+        router = container.moe_layer.router
+        router.config.moe_router_defer_global_aux_loss = True
+        return container, router
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_matches_synchronous_above_fp32_integer_range(self, monkeypatch):
+        """Expert 0 gets 2**24 selections in micro-batch 0 and one more in each later one. The
+        synchronous fp32 running sum stays at 2**24 (each +1 rounds away), so the averages the
+        deferred losses read must round the same way, not use the exact integer sum."""
+        container, router = self._router(num_experts=2)
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        assert (1 << 24) % world == 0
+        big = torch.zeros((1 << 24) // world, 2, dtype=torch.bool, device="cuda")
+        big[:, 0] = True
+        small = torch.zeros(1, 2, dtype=torch.bool, device="cuda")
+        small[0, 0 if rank == 0 else 1] = True
+        routing_maps = [big] + [small] * 4
+        try:
+            ref_avg, ref_grads = _global_aux_loss_trace(
+                router, routing_maps, [False] * 5, monkeypatch
+            )
+            # Micro-batch 0 alone fills expert 0 up to 2**24, so every later +1 crosses it.
+            assert ref_avg[0][0].item() == float(1 << 24)
+            avg, grads = _global_aux_loss_trace(router, routing_maps, [True] * 5, monkeypatch)
+            for k, (ref, out) in enumerate(zip(ref_avg, avg)):
+                assert torch.equal(ref, out), (k, ref, out)
+            for k, (ref, out) in enumerate(zip(ref_grads, grads)):
+                assert torch.equal(ref, out), k
+        finally:
+            del container
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "defer", [[True, False, True], [False, True, True], [True, True, False]]
+    )
+    def test_mixed_synchronous_calls_in_one_step(self, defer, monkeypatch):
+        """A synchronous call in the step (for example during CUDA-graph warmup) counts toward the
+        averages of the later deferred calls, as on the synchronous path."""
+        container, router = self._router(num_experts=8)
+        torch.manual_seed(3000 + torch.distributed.get_rank())
+        routing_maps = []
+        for _ in range(3):
+            experts = torch.randint(0, 8, (64,), device="cuda")
+            routing_maps.append(torch.nn.functional.one_hot(experts, 8).bool())
+        try:
+            ref_avg, ref_grads = _global_aux_loss_trace(
+                router, routing_maps, [False] * 3, monkeypatch
+            )
+            avg, grads = _global_aux_loss_trace(router, routing_maps, defer, monkeypatch)
+            for k, (ref, out) in enumerate(zip(ref_avg, avg)):
+                assert torch.equal(ref, out), (k, ref, out)
+            for k, (ref, out) in enumerate(zip(ref_grads, grads)):
+                assert torch.equal(ref, out), k
+        finally:
+            del container
