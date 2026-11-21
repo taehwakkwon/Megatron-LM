@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end determinism of one variant on one node with 8 GPUs: --deterministic-mode, off vs on,
 # lm loss and grad norm must be bitwise equal every iteration (analyze.py compares them).
-# Usage: OUT_ROOT=/shared/e19 bash exp_aux_defer_2p24/run_e2e.sh <variant> [iters]
+# Usage: OUT_ROOT=/shared/e19 [E2E_CONFIGS="ep8 pp2vpp2_rc"] bash exp_aux_defer_2p24/run_e2e.sh <variant> [iters]
 # Configs: ep8 (TP1 EP8 PP1, MTP 1 layer) and pp2vpp2_rc (TP2+SP EP4 PP2 VPP2, full recompute).
 set -uo pipefail
 VARIANT=${1:?variant}; ITERS=${2:-30}
@@ -25,10 +25,10 @@ BASE=(
 )
 declare -A CFG=(
   [ep8]="--tensor-model-parallel-size 1 --expert-model-parallel-size 8 --pipeline-model-parallel-size 1 --mtp-num-layers 1"
-  [pp2vpp2_rc]="--tensor-model-parallel-size 2 --sequence-parallel --expert-model-parallel-size 4 --pipeline-model-parallel-size 2 --num-layers-per-virtual-pipeline-stage 2 --recompute-granularity full --recompute-method uniform --recompute-num-layers 1"
+  [pp2vpp2_rc]="--tensor-model-parallel-size 2 --sequence-parallel --expert-model-parallel-size 4 --expert-tensor-parallel-size 1 --pipeline-model-parallel-size 2 --num-layers-per-virtual-pipeline-stage 2 --recompute-granularity full --recompute-method uniform --recompute-num-layers 1"
 )
 rc=0
-for c in ep8 pp2vpp2_rc; do
+for c in ${E2E_CONFIGS:-ep8 pp2vpp2_rc}; do
   for side in off on; do
     RUN=${VARIANT}_${c}_${side}; OUT=${OUT_ROOT:?set OUT_ROOT}/e2e/$RUN; mkdir -p "$OUT"
     EXTRA=(${CFG[$c]} --tensorboard-dir $OUT/tb --tensorboard-log-interval 1)
