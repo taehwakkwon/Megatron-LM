@@ -303,18 +303,19 @@ class TopKRouter(Router):
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            # Integer counts: the running sum stays exact however many tokens a step routes.
             self.register_buffer(
                 'global_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 'ga_steps',
-                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                torch.tensor(0, dtype=torch.int64, device=torch.cuda.current_device()),
                 persistent=False,
             )
         else:
