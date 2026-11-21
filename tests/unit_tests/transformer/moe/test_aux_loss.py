@@ -1260,7 +1260,6 @@ class TestDeferredGlobalAuxLossAccumulation:
             pp_size=1,
             cp_size=1,
             num_moe_experts=num_experts,
-            moe_router_topk=1,
             moe_router_load_balancing_type="global_aux_loss",
             moe_token_dispatcher_type="alltoall",
             moe_aux_loss_coeff=1.0,
