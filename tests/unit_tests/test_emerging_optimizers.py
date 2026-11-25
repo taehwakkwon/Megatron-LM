@@ -13,8 +13,11 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.model_initialization import (
     initialize_muon_ht_parameters,
+    logical_frobenius_inner_product,
     logical_frobenius_norm,
+    logical_group_frobenius_inner_product,
     logical_matrix_rows,
+    logical_split_group_index,
 )
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer import emerging_optimizers as eo_mod
@@ -962,6 +965,126 @@ def test_muon_ht_fixed_radius_and_validation():
             hyperball_radius=1e-4,
             pg_collection=pg_collection,
         )
+
+
+# ---------------------------------------------------------------------------
+# Split-group (Q/K/V) logical Frobenius helpers
+# ---------------------------------------------------------------------------
+
+_SPLIT_SHAPES = [4, 2, 2]  # period 8: rows 0-3 -> group 0, 4-5 -> group 1, 6-7 -> group 2
+_SPLIT_PERIOD_GROUPS = [0, 0, 0, 0, 1, 1, 2, 2]
+
+
+def _empty_process_groups() -> ProcessGroupCollection:
+    return ProcessGroupCollection(tp=None, expt_tp=None, gtp_remat=None, expt_gtp_remat=None)
+
+
+def _simulated_gtp(monkeypatch, gtp_rank: int, gtp_size: int = 2):
+    """Pretend this rank is ``gtp_rank`` of a ``gtp_size`` GTP-remat group."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    monkeypatch.setattr("megatron.core.model_initialization.get_pg_size", lambda group: gtp_size)
+    monkeypatch.setattr("megatron.core.model_initialization.get_pg_rank", lambda group: gtp_rank)
+    return SimpleNamespace(tp=None, expt_tp=None, gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+
+def _gtp_shard(full: torch.Tensor, pad_length: int, gtp_rank: int, gtp_size: int = 2):
+    """This rank's GTP-remat row shard of ``full`` after padding it with ``pad_length`` rows."""
+    padded = torch.nn.functional.pad(full, (0, 0, 0, pad_length))
+    local_rows = padded.size(0) // gtp_size
+    shard = nn.Parameter(padded[gtp_rank * local_rows : (gtp_rank + 1) * local_rows].clone())
+    shard.is_gtp_weight_remat = True
+    shard.pad_length = pad_length
+    return shard
+
+
+def test_split_group_index_is_periodic_over_query_groups():
+    """Two query groups of [q(4) | k(2) | v(2)] rows: Q rows of both groups form group 0."""
+    param = nn.Parameter(torch.zeros(16, 8))
+    index = logical_split_group_index(param, _SPLIT_SHAPES, _empty_process_groups())
+    assert index.dtype == torch.int64
+    assert index.device == param.device
+    assert index.tolist() == _SPLIT_PERIOD_GROUPS * 2
+
+
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+def test_split_group_index_offsets_by_gtp_rank_and_marks_padding(monkeypatch, gtp_rank):
+    """16 logical rows padded to 18 and sharded in 9-row halves; padding maps to bucket G."""
+    groups = _simulated_gtp(monkeypatch, gtp_rank)
+    param = _gtp_shard(torch.zeros(16, 8), pad_length=2, gtp_rank=gtp_rank)
+    full = _SPLIT_PERIOD_GROUPS * 2 + [3, 3]
+    index = logical_split_group_index(param, _SPLIT_SHAPES, groups)
+    assert index.tolist() == full[gtp_rank * 9 : (gtp_rank + 1) * 9]
+
+
+def test_split_group_index_rejects_shard_that_cuts_a_query_group():
+    """12 rows cannot hold whole [4, 2, 2] query groups (e.g. TP > num_query_groups)."""
+    param = nn.Parameter(torch.zeros(12, 8))
+    with pytest.raises(RuntimeError, match="split"):
+        logical_split_group_index(param, _SPLIT_SHAPES, _empty_process_groups())
+
+
+def test_group_inner_product_matches_full_matrix_reference(monkeypatch):
+    """Per-group squared norms summed over two GTP shards equal the full-matrix reference."""
+    torch.manual_seed(0)
+    full = torch.randn(16, 8)
+    expected = torch.stack(
+        [
+            full[[r for r in range(16) if _SPLIT_PERIOD_GROUPS[r % 8] == g]].square().sum()
+            for g in range(3)
+        ]
+    )
+
+    local_rank, other_rank = 0, 1
+    padded = torch.nn.functional.pad(full, (0, 0, 0, 2))
+    other_vector = torch.zeros(3)
+    for r in range(other_rank * 9, min((other_rank + 1) * 9, 16)):
+        other_vector[_SPLIT_PERIOD_GROUPS[r % 8]] += padded[r].square().sum()
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        tensor.add_(other_vector if tensor.numel() == 3 else other_vector.sum())
+
+    groups = _simulated_gtp(monkeypatch, local_rank)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
+    param = _gtp_shard(full, pad_length=2, gtp_rank=local_rank)
+    index = logical_split_group_index(param, _SPLIT_SHAPES, groups)
+
+    result = logical_group_frobenius_inner_product(param, param, param, index, 3, groups)
+
+    assert result.dtype == torch.float32
+    assert result.shape == (3,)
+    torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(
+        result.sum(), logical_frobenius_inner_product(param, param, param, groups)
+    )
+
+
+def test_group_inner_product_stages_cpu_vector_through_cuda_for_nccl(monkeypatch):
+    """A CPU-resident TP shard reduces its [G] vector on CUDA and gets it back on CPU."""
+    from types import SimpleNamespace
+
+    tp_group = object()
+    groups = SimpleNamespace(tp=tp_group, expt_tp=None, gtp_remat=None, expt_gtp_remat=None)
+    monkeypatch.setattr("megatron.core.model_initialization.get_pg_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
+    seen = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen.append((tensor.device.type, tuple(tensor.shape), group))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    param = nn.Parameter(torch.randn(8, 4))
+    param.tensor_model_parallel = True
+    param.partition_dim = 0
+    index = logical_split_group_index(param, _SPLIT_SHAPES, groups)
+
+    result = logical_group_frobenius_inner_product(param, param, param, index, 3, groups)
+
+    assert seen == [("cuda", (3,), tp_group)]
+    assert result.device.type == "cpu"
+    assert result.shape == (3,)
 
 
 @pytest.mark.skipif(

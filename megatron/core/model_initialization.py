@@ -3,7 +3,7 @@
 """Model parameter initialization constraints."""
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 
@@ -165,17 +165,87 @@ def logical_frobenius_inner_product(
         raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
     rows = logical_matrix_rows(param, pg_collection)
     inner_product = (lhs[:rows].float() * rhs[:rows].float()).sum()
+    return _reduce_over_shard_groups(inner_product, param, pg_collection)
+
+
+def _reduce_over_shard_groups(
+    value: torch.Tensor, param: torch.Tensor, pg_collection: ProcessGroupCollection
+) -> torch.Tensor:
+    """Sum ``value`` over every group that shards ``param``, staging CPU values for NCCL."""
+    device = value.device
     for group in _parameter_shard_groups(param, pg_collection):
-        reduction_input = inner_product
-        if inner_product.device.type == "cpu" and torch.distributed.get_backend(group) == "nccl":
-            reduction_input = inner_product.to(
-                device=torch.device("cuda", torch.cuda.current_device())
-            )
+        reduction_input = value
+        if value.device.type == "cpu" and torch.distributed.get_backend(group) == "nccl":
+            reduction_input = value.to(device=torch.device("cuda", torch.cuda.current_device()))
         torch.distributed.all_reduce(
             reduction_input, op=torch.distributed.ReduceOp.SUM, group=group
         )
-        inner_product = reduction_input.to(device=lhs.device)
-    return inner_product
+        value = reduction_input.to(device=device)
+    return value
+
+
+def logical_split_group_index(
+    param: torch.Tensor, split_shapes: Sequence[int], pg_collection: ProcessGroupCollection
+) -> torch.Tensor:
+    """Map every local row of a split (e.g. fused QKV) matrix to its split group.
+
+    The TP-local matrix is a stack of identical blocks of ``sum(split_shapes)`` rows (one per
+    query group); row ``r`` of a block belongs to group ``j`` when it falls in the ``j``-th
+    slice of ``split_shapes``. GTP-remat shards these rows contiguously and pads the end, so
+    this rank's rows are offset by its GTP rank and padding rows map to ``len(split_shapes)``.
+
+    Returns:
+        ``int64`` tensor of shape ``[param.shape[0]]`` on ``param.device``.
+    """
+    if pg_collection is None:
+        raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
+    if not split_shapes or any(size <= 0 for size in split_shapes):
+        raise ValueError(f"Muon Hyperball split shapes must be positive: {list(split_shapes)}")
+    local_rows = param.shape[0]
+    gtp_size, gtp_rank = 1, 0
+    if getattr(param, "is_gtp_weight_remat", False):
+        group = (
+            pg_collection.expt_gtp_remat
+            if _is_expert_parameter(param)
+            else pg_collection.gtp_remat
+        )
+        if group is None:
+            raise RuntimeError("Muon Hyperball is missing the parameter's GTP-remat group")
+        gtp_size, gtp_rank = get_pg_size(group), get_pg_rank(group)
+    period = sum(split_shapes)
+    real_rows = local_rows * gtp_size - (getattr(param, "pad_length", 0) if gtp_size > 1 else 0)
+    if real_rows % period != 0:
+        raise RuntimeError(
+            f"Muon Hyperball QKV split does not tile the matrix: {real_rows} unpadded rows "
+            f"(local shape {tuple(param.shape)}) are not a multiple of "
+            f"sum(split_shapes)={period}, split_shapes={list(split_shapes)}"
+        )
+    boundaries = torch.tensor(split_shapes, device=param.device).cumsum(0)
+    global_rows = torch.arange(local_rows, device=param.device) + gtp_rank * local_rows
+    index = torch.bucketize(global_rows % period, boundaries, right=True)
+    index[global_rows >= real_rows] = len(split_shapes)
+    return index
+
+
+def logical_group_frobenius_inner_product(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    param: torch.Tensor,
+    group_index: torch.Tensor,
+    num_groups: int,
+    pg_collection: ProcessGroupCollection,
+) -> torch.Tensor:
+    """FP32 Frobenius inner product per split group, over all unique shards of a parameter.
+
+    ``group_index`` comes from :func:`logical_split_group_index`; rows mapped to
+    ``num_groups`` (padding) are dropped. Returns a ``[num_groups]`` tensor.
+    """
+    if pg_collection is None:
+        raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
+    row_products = (lhs.float() * rhs.float()).sum(dim=1)
+    sums = torch.zeros(num_groups + 1, dtype=torch.float32, device=row_products.device)
+    sums.index_add_(0, group_index.to(row_products.device), row_products)
+    return _reduce_over_shard_groups(sums[:num_groups].contiguous(), param, pg_collection)
 
 
 @torch.no_grad()  # type: ignore[misc]
