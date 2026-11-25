@@ -677,6 +677,8 @@ class TensorParallelMuonH(TensorParallelMuon):
         hyperball_eps: Minimum norm used for numerical stability.
         hyperball_radius: Optional common Frobenius radius. None preserves each matrix's
             initial/restored logical norm, following https://arxiv.org/abs/2606.16899.
+            Split QKV weights always keep their discovered per-group norms; model
+            initialization has already scaled them to this radius in total.
         pg_collection: Explicit model-parallel process groups used for sharded norms.
         **kwargs: Arguments passed to :class:`TensorParallelMuon`.
     """
@@ -698,6 +700,7 @@ class TensorParallelMuonH(TensorParallelMuon):
         self.hyperball_radius = hyperball_radius
         self._hyperball_radii: dict[torch.Tensor, torch.Tensor] = {}
         self._hyperball_group_index: dict[torch.Tensor, tuple[torch.Tensor, int] | None] = {}
+        self._warned_split_radius_mismatch = False
         super().__init__(params, pg_collection=pg_collection, **kwargs)
 
         for group in self.param_groups:
@@ -770,6 +773,28 @@ class TensorParallelMuonH(TensorParallelMuon):
         row_scale = torch.cat([scale, scale.new_zeros(1)])[index.to(scale.device)]
         tensor.mul_(row_scale.to(device=tensor.device, dtype=tensor.dtype).unsqueeze(-1))
 
+    def _warn_if_split_radius_mismatch(self, group_radii: torch.Tensor) -> None:
+        """Warn once when split groups keep a total norm other than ``hyperball_radius``.
+
+        Happens when weights arrive after initialization with another norm, e.g. from a
+        checkpoint trained without Hyperball or with a different radius. Whole matrices snap
+        to the configured radius on their first step; split QKV groups keep their norms.
+        """
+        if self._warned_split_radius_mismatch:
+            return
+        total = group_radii.square().sum().sqrt().item()
+        if abs(total - self.hyperball_radius) <= 1e-3 * self.hyperball_radius:
+            return
+        self._warned_split_radius_mismatch = True
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Muon Hyperball keeps the per-group norms of split QKV weights (total {total:.4g}) "
+            f"instead of rescaling them to hyperball_radius={self.hyperball_radius}; only "
+            "unsplit matrices snap to the configured radius. Expected when loading weights "
+            "trained without Hyperball or with another radius. Warning once.",
+        )
+
     @torch.no_grad()
     def _radius_for_parameter(self, p: torch.Tensor) -> torch.Tensor:
         """Resolve a fixed radius only after model/master-weight restoration has finished.
@@ -788,6 +813,8 @@ class TensorParallelMuonH(TensorParallelMuon):
                     f"got group norms {radius.tolist()} for a parameter of shape "
                     f"{tuple(p.shape)}"
                 )
+            if radius.ndim and self.hyperball_radius is not None:
+                self._warn_if_split_radius_mismatch(radius)
             self._hyperball_radii[p] = radius
         return self._hyperball_radii[p]
 

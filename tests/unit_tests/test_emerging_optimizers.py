@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
+import logging
 import os
 
 import pytest
@@ -1208,7 +1209,12 @@ def test_muon_h_split_qkv_falls_back_to_whole_matrix_when_ns_cannot_split(monkey
     parameter = _qkv_parameter()
     parameter.is_gtp_weight_remat = True
     parameter.pad_length = 0
-    for tp_mode, splits in [("blockwise", False), ("distributed", False), ("duplicated", True)]:
+    for tp_mode, splits in [
+        ("blockwise", False),
+        ("distributed", False),
+        ("duplicated", True),
+        ("auto", True),  # Newton-Schulz pins auto to duplicated when splitting QKV
+    ]:
         optimizer = _split_muon_h([parameter], tp_mode=tp_mode, pg_collection=groups)
         if splits:
             monkeypatch.setattr("megatron.core.model_initialization.get_pg_size", lambda group: 2)
@@ -1266,8 +1272,10 @@ def test_muon_h_split_qkv_rebuilds_radii_after_load_state_dict():
     optimizer = _split_muon_h([parameter])
     parameter.grad = torch.randn_like(parameter)
     optimizer.step()
+    group_index = optimizer._hyperball_group_index[parameter]
     optimizer.load_state_dict(optimizer.state_dict())
     assert not optimizer._hyperball_radii
+    assert optimizer._hyperball_group_index[parameter] is group_index  # layout-only, survives
     with torch.no_grad():
         parameter.mul_(0.5)  # restored weights arrive after load_state_dict
     restored = _group_norms(parameter.detach())
@@ -1288,6 +1296,53 @@ def test_muon_h_split_qkv_discovers_radii_even_with_configured_radius():
     torch.testing.assert_close(optimizer._hyperball_radii[parameter], group_norms)
     torch.testing.assert_close(group_norms.square().sum(), torch.tensor(6.25, device="cuda"))
     torch.testing.assert_close(parameter.detach().norm(), torch.tensor(2.5, device="cuda"))
+
+
+def test_muon_h_split_qkv_warns_once_when_configured_radius_disagrees(caplog):
+    """Weights arriving with another norm (e.g. a non-Hyperball checkpoint) keep their group
+    norms for split QKV, unlike whole matrices that snap to the configured radius: say so."""
+    matched, mismatched = _qkv_parameter(), _qkv_parameter()
+    with torch.no_grad():
+        matched.mul_(2.5 / matched.norm())
+        mismatched.mul_(4.0 / mismatched.norm())
+    with caplog.at_level(logging.WARNING):
+        optimizer = _split_muon_h([matched], hyperball_radius=2.5)
+        matched.grad = torch.randn_like(matched)
+        optimizer.step()
+    assert "hyperball_radius" not in caplog.text
+
+    optimizer = _split_muon_h([mismatched], hyperball_radius=2.5)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            mismatched.grad = torch.randn_like(mismatched)
+            optimizer.step()
+            optimizer.reset_parameter_cache()
+    assert optimizer._warned_split_radius_mismatch
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    assert caplog.text.count("hyperball_radius") == (1 if rank == 0 else 0)  # log_single_rank
+    torch.testing.assert_close(mismatched.detach().norm(), torch.tensor(4.0, device="cuda"))
+
+
+def test_muon_h_split_qkv_supports_four_split_groups():
+    """attention_output_gate adds a fourth split group; each one keeps its own norm."""
+    split_shapes = [4, 4, 2, 2]  # q | gate | k | v per query group
+    bounds = [0, 4, 8, 10, 12]
+    torch.manual_seed(5)
+    parameter = nn.Parameter(torch.randn(24, 8, device="cuda"))
+    parameter.is_qkv = True
+    parameter.qkv_split_shapes = split_shapes
+    rows = [[r for r in range(24) if bounds[g] <= r % 12 < bounds[g + 1]] for g in range(4)]
+    with torch.no_grad():
+        for group, scale in enumerate([1.0, 0.25, 3.0, 0.5]):
+            parameter[rows[group]] *= scale
+    before = torch.stack([parameter.detach()[r].norm() for r in rows])
+    optimizer = _split_muon_h([parameter], qkv_split_shapes=split_shapes)
+    for _ in range(2):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    assert optimizer._split_groups(parameter)[1] == 4
+    after = torch.stack([parameter.detach()[r].norm() for r in rows])
+    torch.testing.assert_close(after, before, rtol=1e-5, atol=0)
 
 
 def _reference_split_hyperball_update(weight: torch.Tensor, update: torch.Tensor, lr: float):
