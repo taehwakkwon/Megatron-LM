@@ -1211,9 +1211,7 @@ def test_muon_h_split_qkv_falls_back_to_whole_matrix_when_ns_cannot_split(monkey
     for tp_mode, splits in [("blockwise", False), ("distributed", False), ("duplicated", True)]:
         optimizer = _split_muon_h([parameter], tp_mode=tp_mode, pg_collection=groups)
         if splits:
-            monkeypatch.setattr(
-                "megatron.core.model_initialization.get_pg_size", lambda group: 2
-            )
+            monkeypatch.setattr("megatron.core.model_initialization.get_pg_size", lambda group: 2)
             monkeypatch.setattr("megatron.core.model_initialization.get_pg_rank", lambda group: 0)
             assert optimizer._split_groups(parameter)[1] == 3
         else:
@@ -1292,10 +1290,22 @@ def test_muon_h_split_qkv_discovers_radii_even_with_configured_radius():
     torch.testing.assert_close(parameter.detach().norm(), torch.tensor(2.5, device="cuda"))
 
 
+def _reference_split_hyperball_update(weight: torch.Tensor, update: torch.Tensor, lr: float):
+    """Single-rank per-split-group Hyperball step on full matrices: (new weight, scaled update)."""
+    new_weight, scaled_update = torch.empty_like(weight), torch.empty_like(update)
+    for group in range(3):
+        rows = _split_rows(group, weight.size(0))
+        w, u = weight[rows], update[rows]
+        radius = w.norm()
+        scaled_update[rows] = radius * u / u.norm()
+        stepped = w - lr * scaled_update[rows]
+        new_weight[rows] = radius * stepped / stepped.norm()
+    return new_weight, scaled_update
+
+
 def _per_group_inner_products(weight: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
-    return torch.stack(
-        [(weight[_split_rows(g)] * tensor[_split_rows(g)]).sum() for g in range(3)]
-    )
+    rows = [_split_rows(g, weight.size(0)) for g in range(3)]
+    return torch.stack([(weight[r] * tensor[r]).sum() for r in rows])
 
 
 def test_muon_ht_split_qkv_projects_gradient_per_group():
@@ -1929,6 +1939,46 @@ class TestMuonOptimizerMultiRankTP:
             global_inner_product, torch.zeros_like(global_inner_product), atol=1e-5, rtol=0.0
         )
 
+    def test_muon_h_split_qkv_uses_global_group_norm_for_tp_shards(self):
+        """Each TP rank holds one query group; split groups span both ranks."""
+        pg_collection = _muon_ht_process_groups()
+        tp_rank, tp_size = pg_collection.tp.rank(), pg_collection.tp.size()
+        torch.manual_seed(7)  # identical full matrices on every rank
+        full_weight = torch.randn(8 * tp_size, 8, device="cuda")
+        full_update = torch.randn_like(full_weight)
+        full_gradient = torch.randn_like(full_weight)
+        for group, scale in enumerate([1.0, 3.0, 0.5]):
+            full_weight[_split_rows(group, full_weight.size(0))] *= scale
+        rows = slice(8 * tp_rank, 8 * (tp_rank + 1))
+        parameter = nn.Parameter(full_weight[rows].clone())
+        parameter.tensor_model_parallel = True
+        parameter.partition_dim = 0
+        parameter.is_qkv = True
+        parameter.qkv_split_shapes = list(_SPLIT_SHAPES)
+        update = full_update[rows].clone()
+        optimizer = _split_muon_h(
+            [parameter], optimizer_class=TensorParallelMuonHT, pg_collection=pg_collection
+        )
+        reference_weight, reference_update = _reference_split_hyperball_update(
+            full_weight, full_update, lr=0.1
+        )
+
+        with torch.no_grad():
+            tangent = optimizer._project_gradient_to_tangent(parameter, full_gradient[rows])
+            inner_products = _per_group_inner_products(parameter.detach(), tangent)
+            torch.distributed.all_reduce(inner_products, group=pg_collection.tp)
+            torch.testing.assert_close(
+                inner_products, torch.zeros(3, device="cuda"), atol=1e-5, rtol=0
+            )
+
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+            parameter.add_(update, alpha=-0.1)
+            optimizer.post_weight_update_fn_inplace(parameter)
+
+        torch.testing.assert_close(optimizer._hyperball_radii[parameter], _group_norms(full_weight))
+        torch.testing.assert_close(update, reference_update[rows], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(parameter.detach(), reference_weight[rows], rtol=1e-5, atol=1e-6)
+
     def test_muon_ht_initializes_cpu_tp_shards_over_nccl(self):
         """CPU-initialized TP shards should use CUDA scalars for NCCL reductions."""
         pg_collection = _optimizer_process_groups()
@@ -2011,6 +2061,70 @@ class TestMuonOptimizerMultiRankGTP:
         result_norm_squared = parameter.float().square().sum()
         torch.distributed.all_reduce(result_norm_squared, group=pg_collection.gtp_remat)
         torch.testing.assert_close(result_norm_squared.sqrt(), radius)
+
+    @pytest.mark.skipif(
+        int(os.getenv("WORLD_SIZE", "1")) != 2, reason="Shard layout is written for 2 GTP ranks"
+    )
+    def test_muon_h_split_qkv_uses_global_group_norm_for_gtp_shards(self):
+        """A [16, 8] QKV weight padded by 6 rows: the GTP boundary (row 11) cuts a Q block."""
+        pg_collection = _muon_ht_process_groups()
+        gtp_rank = pg_collection.gtp_remat.rank()
+        pad_length = 6
+        torch.manual_seed(11)  # identical full matrices on every rank
+        full_weight = torch.randn(16, 8, device="cuda")
+        full_update = torch.randn_like(full_weight)
+        full_gradient = torch.randn_like(full_weight)
+        for group, scale in enumerate([1.0, 3.0, 0.5]):
+            full_weight[_split_rows(group)] *= scale
+        parameter = _gtp_shard(full_weight, pad_length, gtp_rank)
+        parameter.tensor_model_parallel = False
+        parameter.partition_dim = -1
+        parameter.allreduce = True
+        parameter.is_qkv = True
+        parameter.qkv_split_shapes = list(_SPLIT_SHAPES)
+        update = _gtp_shard(full_update, pad_length, gtp_rank).detach()
+        gradient = _gtp_shard(full_gradient, pad_length, gtp_rank).detach()
+        optimizer = _split_muon_h(
+            [parameter], optimizer_class=TensorParallelMuonHT, pg_collection=pg_collection
+        )
+        reference_weight, reference_update = _reference_split_hyperball_update(
+            full_weight, full_update, lr=0.1
+        )
+
+        with torch.no_grad():
+            tangent = optimizer._project_gradient_to_tangent(parameter, gradient)
+            full_parameter = torch.cat([parameter.detach(), torch.empty_like(parameter)], dim=0)
+            torch.distributed.all_gather_into_tensor(
+                full_parameter, parameter.detach(), group=pg_collection.gtp_remat
+            )
+            full_tangent = torch.empty_like(full_parameter)
+            torch.distributed.all_gather_into_tensor(
+                full_tangent, tangent.contiguous(), group=pg_collection.gtp_remat
+            )
+            torch.testing.assert_close(
+                _per_group_inner_products(full_parameter[:16], full_tangent[:16]),
+                torch.zeros(3, device="cuda"),
+                atol=1e-5,
+                rtol=0,
+            )
+
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+            parameter.add_(update, alpha=-0.1)
+            optimizer.post_weight_update_fn_inplace(parameter)
+
+        torch.testing.assert_close(optimizer._hyperball_radii[parameter], _group_norms(full_weight))
+        torch.testing.assert_close(
+            update,
+            _gtp_shard(reference_update, pad_length, gtp_rank).detach(),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            parameter.detach(),
+            _gtp_shard(reference_weight, pad_length, gtp_rank).detach(),
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 # All non-custom coefficient types supported by emerging_optimizers.

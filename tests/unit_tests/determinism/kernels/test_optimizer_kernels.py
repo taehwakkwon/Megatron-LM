@@ -189,8 +189,13 @@ def test_fused_adam_step_replays(monkeypatch, rmsnorm_weight_decay_mult):
 )
 @pytest.mark.parametrize("optimizer_cls", [TensorParallelMuonH, TensorParallelMuonHT])
 @pytest.mark.parametrize("configured_radius", [None, 2.5])
-def test_hyperball_muon_update_replays(optimizer_cls, configured_radius):
-    """MuonH/HT projection, normalization, update, and retraction are bit-exact."""
+@pytest.mark.parametrize("split_qkv", [False, True])
+def test_hyperball_muon_update_replays(optimizer_cls, configured_radius, split_qkv):
+    """MuonH/HT projection, normalization, update, and retraction are bit-exact.
+
+    With ``split_qkv`` every replayed weight is treated as a fused QKV matrix of
+    [4, 2, 2]-row query groups, exercising the per-split-group reductions.
+    """
     seeded()
     radius = 2.5
     parameter = torch.randn(2048, 1024, device="cuda", dtype=torch.float32)
@@ -208,6 +213,9 @@ def test_hyperball_muon_update_replays(optimizer_cls, configured_radius):
         hyperball_radius=configured_radius,
         pg_collection=pg_collection,
         tp_mode="duplicated",
+        split_qkv=split_qkv,
+        is_qkv_fn=lambda _p: True,
+        qkv_split_shapes=[4, 2, 2],
     )
 
     def hyperball_update(weight, raw_update):

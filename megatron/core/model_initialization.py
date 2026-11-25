@@ -239,13 +239,17 @@ def logical_group_frobenius_inner_product(
 
     ``group_index`` comes from :func:`logical_split_group_index`; rows mapped to
     ``num_groups`` (padding) are dropped. Returns a ``[num_groups]`` tensor.
+
+    Uses a masked row reduction rather than ``index_add_``, whose CUDA atomics would make
+    the result non-bit-exact across runs.
     """
     if pg_collection is None:
         raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
     row_products = (lhs.float() * rhs.float()).sum(dim=1)
-    sums = torch.zeros(num_groups + 1, dtype=torch.float32, device=row_products.device)
-    sums.index_add_(0, group_index.to(row_products.device), row_products)
-    return _reduce_over_shard_groups(sums[:num_groups].contiguous(), param, pg_collection)
+    groups = torch.arange(num_groups, device=row_products.device).unsqueeze(1)
+    in_group = groups == group_index.to(row_products.device).unsqueeze(0)
+    sums = torch.where(in_group, row_products.unsqueeze(0), 0.0).sum(dim=1)
+    return _reduce_over_shard_groups(sums, param, pg_collection)
 
 
 @torch.no_grad()  # type: ignore[misc]
