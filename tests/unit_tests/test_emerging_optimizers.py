@@ -1298,28 +1298,36 @@ def test_muon_h_split_qkv_discovers_radii_even_with_configured_radius():
     torch.testing.assert_close(parameter.detach().norm(), torch.tensor(2.5, device="cuda"))
 
 
-def test_muon_h_split_qkv_warns_once_when_configured_radius_disagrees(caplog):
+def test_muon_h_split_qkv_warns_once_when_configured_radius_disagrees(monkeypatch):
     """Weights arriving with another norm (e.g. a non-Hyperball checkpoint) keep their group
-    norms for split QKV, unlike whole matrices that snap to the configured radius: say so."""
+    norms for split QKV, unlike whole matrices that snap to the configured radius: say so.
+
+    Captures the log_single_rank call itself: which rank writes the record depends on
+    process-wide log-rank settings, not on this optimizer.
+    """
+    warnings_logged = []
+
+    def record(_logger, level, msg, *args, **kwargs):
+        if level >= logging.WARNING:
+            warnings_logged.append(msg)
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.log_single_rank", record)
     matched, mismatched = _qkv_parameter(), _qkv_parameter()
     with torch.no_grad():
         matched.mul_(2.5 / matched.norm())
         mismatched.mul_(4.0 / mismatched.norm())
-    with caplog.at_level(logging.WARNING):
-        optimizer = _split_muon_h([matched], hyperball_radius=2.5)
-        matched.grad = torch.randn_like(matched)
-        optimizer.step()
-    assert "hyperball_radius" not in caplog.text
+    optimizer = _split_muon_h([matched], hyperball_radius=2.5)
+    matched.grad = torch.randn_like(matched)
+    optimizer.step()
+    assert not warnings_logged
 
     optimizer = _split_muon_h([mismatched], hyperball_radius=2.5)
-    with caplog.at_level(logging.WARNING):
-        for _ in range(2):
-            mismatched.grad = torch.randn_like(mismatched)
-            optimizer.step()
-            optimizer.reset_parameter_cache()
-    assert optimizer._warned_split_radius_mismatch
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    assert caplog.text.count("hyperball_radius") == (1 if rank == 0 else 0)  # log_single_rank
+    for _ in range(2):
+        mismatched.grad = torch.randn_like(mismatched)
+        optimizer.step()
+        optimizer.reset_parameter_cache()
+    assert len(warnings_logged) == 1
+    assert "hyperball_radius=2.5" in warnings_logged[0]
     torch.testing.assert_close(mismatched.detach().norm(), torch.tensor(4.0, device="cuda"))
 
 
