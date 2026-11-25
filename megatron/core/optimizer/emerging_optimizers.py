@@ -20,7 +20,9 @@ from megatron.core.model_initialization import (
     is_muon_parameter,
     logical_frobenius_inner_product,
     logical_frobenius_norm,
+    logical_group_frobenius_inner_product,
     logical_matrix_rows,
+    logical_split_group_index,
     validate_hyperball_config,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -661,6 +663,11 @@ class TensorParallelMuonH(TensorParallelMuon):
     on checkpoint load. Restored weights reconstruct radii within checkpoint precision;
     no scalar distributed-checkpoint entries are introduced.
 
+    Hyperball follows the Newton-Schulz QKV split: when ``split_qkv`` orthogonalizes a
+    fused QKV weight per Q/K/V projection, each projection (across all query groups and
+    TP ranks) gets its own radius, update normalization and retraction. Otherwise the
+    whole matrix is one sphere, as when Newton-Schulz itself falls back to whole-matrix.
+
     This matches Emerging Optimizers' ``MuonHyperball``, often called MuonH. Unlike
     :class:`TensorParallelMuonHT`, it does not project the raw gradient onto the sphere's
     tangent space before momentum and Muon orthogonalization.
@@ -690,6 +697,7 @@ class TensorParallelMuonH(TensorParallelMuon):
         self.hyperball_eps = hyperball_eps
         self.hyperball_radius = hyperball_radius
         self._hyperball_radii: dict[torch.Tensor, torch.Tensor] = {}
+        self._hyperball_group_index: dict[torch.Tensor, tuple[torch.Tensor, int] | None] = {}
         super().__init__(params, pg_collection=pg_collection, **kwargs)
 
         for group in self.param_groups:
@@ -712,42 +720,105 @@ class TensorParallelMuonH(TensorParallelMuon):
         super().load_state_dict(state_dict)
         self.reset_parameter_cache()
 
+    def _split_groups(self, p: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+        """Row-to-group index and group count when Newton-Schulz splits ``p`` into Q/K/V.
+
+        Hyperball follows exactly the split :meth:`orthogonalize` applies: a tagged QKV
+        parameter gets one radius, update normalization and retraction per split group.
+        Returns None (whole-matrix Hyperball) for untagged parameters and when Newton-Schulz
+        itself falls back to whole-matrix, i.e. a GTP-sharded weight outside duplicated mode.
+        The index depends only on the layout, so it survives checkpoint reloads.
+        """
+        if p in self._hyperball_group_index:
+            return self._hyperball_group_index[p]
+        groups = None
+        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+            split_shapes = getattr(p, "qkv_split_shapes", None) or self.qkv_split_shapes
+            if split_shapes and not self._ns_split_falls_back_to_whole_matrix(p):
+                index = logical_split_group_index(p, split_shapes, self.pg_collection)
+                groups = (index, len(split_shapes))
+        self._hyperball_group_index[p] = groups
+        return groups
+
+    def _ns_split_falls_back_to_whole_matrix(self, p: torch.Tensor) -> bool:
+        """Mirror ``scaled_orthogonalize_fn_with_gtp_remat``: only duplicated mode can split."""
+        gtp_group = resolve_gtp_remat_group(self.pg_collection, getattr(p, "expert_tp", False))
+        gtp_active = (
+            gtp_group is not None
+            and get_pg_size(gtp_group) > 1
+            and getattr(p, "is_gtp_weight_remat", False)
+        )
+        return gtp_active and self.tp_mode not in ("duplicated", "auto")
+
+    def _logical_norm(self, tensor: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """FP32 norm of ``tensor`` laid out like ``p``: scalar, or ``[G]`` per split group."""
+        groups = self._split_groups(p)
+        if groups is None:
+            return self._global_frobenius_norm(tensor, p)
+        index, num_groups = groups
+        return logical_group_frobenius_inner_product(
+            tensor, tensor, p, index, num_groups, self.pg_collection
+        ).sqrt()
+
+    def _scale_inplace(self, tensor: torch.Tensor, p: torch.Tensor, scale: torch.Tensor) -> None:
+        """``tensor *= scale``, per split-group row when ``p`` is split; padding rows -> 0."""
+        groups = self._split_groups(p)
+        if groups is None:
+            tensor.mul_(scale.to(dtype=tensor.dtype))
+            return
+        index, _ = groups
+        row_scale = torch.cat([scale, scale.new_zeros(1)])[index.to(scale.device)]
+        tensor.mul_(row_scale.to(device=tensor.device, dtype=tensor.dtype).unsqueeze(-1))
+
     @torch.no_grad()
     def _radius_for_parameter(self, p: torch.Tensor) -> torch.Tensor:
-        """Resolve a fixed radius only after model/master-weight restoration has finished."""
-        if self.hyperball_radius is not None:
+        """Resolve a fixed radius only after model/master-weight restoration has finished.
+
+        Split parameters always discover per-group radii from their weights: model
+        initialization scales the whole matrix to a configured radius, and per-group
+        retraction preserves that total.
+        """
+        if self.hyperball_radius is not None and self._split_groups(p) is None:
             return p.new_tensor(self.hyperball_radius, dtype=torch.float32)
         if p not in self._hyperball_radii:
-            self._hyperball_radii[p] = self._global_frobenius_norm(p, p)
+            radius = self._logical_norm(p, p)
+            if radius.ndim and bool((radius < self.hyperball_eps).any()):
+                raise ValueError(
+                    "Muon Hyperball requires every QKV split group to have a non-zero norm; "
+                    f"got group norms {radius.tolist()} for a parameter of shape "
+                    f"{tuple(p.shape)}"
+                )
+            self._hyperball_radii[p] = radius
         return self._hyperball_radii[p]
 
     def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
-        """Scale the logical update norm to the parameter's fixed radius."""
+        """Scale the logical update norm (per split group) to the parameter's fixed radius."""
         radius = self._radius_for_parameter(p)
         update[logical_matrix_rows(p, self.pg_collection) :].zero_()
-        update_norm = self._global_frobenius_norm(update, p)
+        update_norm = self._logical_norm(update, p)
         is_numerical_zero = update_norm < self.hyperball_eps
         scale = torch.where(
             is_numerical_zero,
             torch.zeros_like(update_norm),
             radius / update_norm.clamp_min(self.hyperball_eps),
         )
-        update.mul_(scale.to(dtype=update.dtype))
+        self._scale_inplace(update, p, scale)
 
     def post_weight_update_fn_inplace(self, p: torch.Tensor) -> None:
-        """Retract to the radius captured before the first update, excluding padding."""
-        if self.hyperball_radius is None and p not in self._hyperball_radii:
+        """Retract (per split group) to the radius captured before the first update."""
+        uses_configured_radius = self.hyperball_radius is not None and self._split_groups(p) is None
+        if not uses_configured_radius and p not in self._hyperball_radii:
             raise RuntimeError("Muon Hyperball post-update requires a preceding pre-update call")
         radius = self._radius_for_parameter(p)
         p[logical_matrix_rows(p, self.pg_collection) :].zero_()
-        p_norm = self._global_frobenius_norm(p, p)
+        p_norm = self._logical_norm(p, p)
         is_numerical_zero = p_norm < self.hyperball_eps
         scale = torch.where(
             is_numerical_zero,
             torch.zeros_like(p_norm),
             radius / p_norm.clamp_min(self.hyperball_eps),
         )
-        p.mul_(scale.to(dtype=p.dtype))
+        self._scale_inplace(p, p, scale)
 
 
 class TensorParallelMuonHT(TensorParallelMuonH):

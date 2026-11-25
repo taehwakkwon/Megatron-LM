@@ -1087,6 +1087,211 @@ def test_group_inner_product_stages_cpu_vector_through_cuda_for_nccl(monkeypatch
     assert result.shape == (3,)
 
 
+# ---------------------------------------------------------------------------
+# MuonH/MuonHT follow the Newton-Schulz QKV split
+# ---------------------------------------------------------------------------
+
+
+def _split_rows(group: int, rows: int = 16) -> list[int]:
+    return [r for r in range(rows) if _SPLIT_PERIOD_GROUPS[r % 8] == group]
+
+
+def _group_norms(t: torch.Tensor) -> torch.Tensor:
+    return torch.stack([t[_split_rows(g, t.size(0))].float().norm() for g in range(3)])
+
+
+def _qkv_parameter(dtype=torch.float32) -> nn.Parameter:
+    """A [16, 8] fused QKV weight (2 query groups of [4, 2, 2]) with distinct group norms."""
+    torch.manual_seed(1234)
+    weight = torch.randn(16, 8, device="cuda")
+    for group, scale in enumerate([1.0, 3.0, 0.5]):
+        weight[_split_rows(group)] *= scale
+    parameter = nn.Parameter(weight.to(dtype))
+    parameter.is_qkv = True
+    parameter.qkv_split_shapes = list(_SPLIT_SHAPES)
+    return parameter
+
+
+def _split_muon_h(params, optimizer_class=TensorParallelMuonH, **kwargs):
+    defaults = dict(
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+        qkv_split_shapes=list(_SPLIT_SHAPES),
+        pg_collection=_muon_ht_process_groups(),
+        tp_mode="duplicated",
+    )
+    defaults.update(kwargs)
+    return optimizer_class(params, **defaults)
+
+
+def test_muon_h_split_qkv_preserves_each_group_norm():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter])
+    before = _group_norms(parameter.detach())
+    for _ in range(3):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    torch.testing.assert_close(_group_norms(parameter.detach()), before, rtol=1e-5, atol=0)
+
+
+def test_muon_h_split_qkv_normalizes_update_per_group():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter])
+    radii = _group_norms(parameter.detach())
+    update = torch.randn_like(parameter)
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+    torch.testing.assert_close(_group_norms(update), radii, rtol=1e-5, atol=0)
+
+
+def test_muon_h_split_qkv_matches_single_rank_reference_loop():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter])
+    weight_before = parameter.detach().clone()
+    radii = _group_norms(weight_before)
+    captured = []
+    orthogonalize = optimizer.orthogonalize
+
+    def recording_orthogonalize(p, grad, **kwargs):
+        result = orthogonalize(p, grad, **kwargs)
+        captured.append(result.clone())
+        return result
+
+    optimizer.orthogonalize = recording_orthogonalize
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+
+    (orth,) = captured
+    reference = torch.empty_like(weight_before)
+    for group in range(3):
+        rows = _split_rows(group)
+        w, u, radius = weight_before[rows], orth[rows], radii[group]
+        stepped = w - 0.1 * radius * u / u.norm()
+        reference[rows] = radius * stepped / stepped.norm()
+    torch.testing.assert_close(parameter.detach(), reference, rtol=1e-5, atol=1e-6)
+
+
+def test_muon_h_without_split_qkv_is_bitwise_whole_matrix():
+    tagged, untagged = _qkv_parameter(), _qkv_parameter()
+    del untagged.is_qkv
+    grad = torch.randn_like(tagged)
+    for parameter in (tagged, untagged):
+        parameter.grad = grad.clone()
+        _split_muon_h([parameter], split_qkv=False).step()
+    assert torch.equal(tagged, untagged)
+
+
+def test_muon_h_split_qkv_leaves_untagged_matrices_whole():
+    qkv = _qkv_parameter()
+    other = nn.Parameter(torch.randn(16, 8, device="cuda"))
+    optimizer = _split_muon_h([qkv, other])
+    other_radius = other.detach().norm()
+    other.grad = torch.randn_like(other)
+    qkv.grad = torch.randn_like(qkv)
+    optimizer.step()
+    assert optimizer._split_groups(other) is None
+    assert optimizer._split_groups(qkv)[1] == 3
+    torch.testing.assert_close(other.detach().norm(), other_radius, rtol=1e-5, atol=0)
+    assert optimizer._hyperball_radii[other].shape == ()
+
+
+def test_muon_h_split_qkv_falls_back_to_whole_matrix_when_ns_cannot_split(monkeypatch):
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    groups = SimpleNamespace(tp=None, expt_tp=None, gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
+    parameter = _qkv_parameter()
+    parameter.is_gtp_weight_remat = True
+    parameter.pad_length = 0
+    for tp_mode, splits in [("blockwise", False), ("distributed", False), ("duplicated", True)]:
+        optimizer = _split_muon_h([parameter], tp_mode=tp_mode, pg_collection=groups)
+        if splits:
+            monkeypatch.setattr(
+                "megatron.core.model_initialization.get_pg_size", lambda group: 2
+            )
+            monkeypatch.setattr("megatron.core.model_initialization.get_pg_rank", lambda group: 0)
+            assert optimizer._split_groups(parameter)[1] == 3
+        else:
+            assert optimizer._split_groups(parameter) is None
+
+
+def test_muon_h_split_qkv_rejects_zero_norm_group():
+    parameter = _qkv_parameter()
+    with torch.no_grad():
+        parameter[_split_rows(1)] = 0.0
+    optimizer = _split_muon_h([parameter])
+    parameter.grad = torch.randn_like(parameter)
+    with pytest.raises(ValueError, match="non-zero"):
+        optimizer.step()
+
+
+def test_muon_h_split_qkv_zero_update_group_is_left_unmoved():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter])
+    before = parameter.detach().clone()
+    radii = _group_norms(before)
+    grad = torch.randn_like(parameter)
+    grad[_split_rows(2)] = 0.0
+    parameter.grad = grad
+    optimizer.step()
+    v_rows = _split_rows(2)
+    torch.testing.assert_close(parameter.detach()[v_rows], before[v_rows], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(_group_norms(parameter.detach()), radii, rtol=1e-5, atol=0)
+    assert not torch.allclose(parameter.detach()[_split_rows(0)], before[_split_rows(0)])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_muon_h_split_qkv_keeps_low_precision_dtype(dtype):
+    # Newton-Schulz itself requires FP32 input (Megatron feeds it FP32 main params), so drive
+    # the Hyperball hooks directly with low-precision weights and updates.
+    parameter = _qkv_parameter(dtype)
+    optimizer = _split_muon_h([parameter])
+    radii = _group_norms(parameter.detach())
+    update = torch.randn_like(parameter)
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        assert update.dtype == dtype
+        torch.testing.assert_close(_group_norms(update), radii, rtol=2e-2, atol=0)
+        parameter.add_(update, alpha=-0.1)
+        optimizer.post_weight_update_fn_inplace(parameter)
+    assert parameter.dtype == dtype
+    torch.testing.assert_close(_group_norms(parameter.detach()), radii, rtol=2e-2, atol=0)
+
+
+def test_muon_h_split_qkv_rebuilds_radii_after_load_state_dict():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter])
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    optimizer.load_state_dict(optimizer.state_dict())
+    assert not optimizer._hyperball_radii
+    with torch.no_grad():
+        parameter.mul_(0.5)  # restored weights arrive after load_state_dict
+    restored = _group_norms(parameter.detach())
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    torch.testing.assert_close(optimizer._hyperball_radii[parameter], restored, rtol=1e-6, atol=0)
+    torch.testing.assert_close(_group_norms(parameter.detach()), restored, rtol=1e-5, atol=0)
+
+
+def test_muon_h_split_qkv_discovers_radii_even_with_configured_radius():
+    parameter = _qkv_parameter()
+    with torch.no_grad():
+        parameter.mul_(2.5 / parameter.norm())  # what model initialization does for radius=2.5
+    group_norms = _group_norms(parameter.detach())
+    optimizer = _split_muon_h([parameter], hyperball_radius=2.5)
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    torch.testing.assert_close(optimizer._hyperball_radii[parameter], group_norms)
+    torch.testing.assert_close(group_norms.square().sum(), torch.tensor(6.25, device="cuda"))
+    torch.testing.assert_close(parameter.detach().norm(), torch.tensor(2.5, device="cuda"))
+
+
 @pytest.mark.skipif(
     int(os.getenv("WORLD_SIZE", "1")) < 4, reason="Combined TP/GTP test requires at least 4 ranks"
 )
