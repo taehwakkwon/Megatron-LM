@@ -1292,6 +1292,50 @@ def test_muon_h_split_qkv_discovers_radii_even_with_configured_radius():
     torch.testing.assert_close(parameter.detach().norm(), torch.tensor(2.5, device="cuda"))
 
 
+def _per_group_inner_products(weight: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [(weight[_split_rows(g)] * tensor[_split_rows(g)]).sum() for g in range(3)]
+    )
+
+
+def test_muon_ht_split_qkv_projects_gradient_per_group():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h([parameter], optimizer_class=TensorParallelMuonHT)
+    grad = torch.randn_like(parameter)
+    projected = optimizer._project_gradient_to_tangent(parameter, grad)
+    torch.testing.assert_close(
+        _per_group_inner_products(parameter.detach(), projected),
+        torch.zeros(3, device="cuda"),
+        atol=1e-5,
+        rtol=0,
+    )
+    # Each group's projection is exactly G_g - <W_g,G_g>/<W_g,W_g> W_g.
+    for group in range(3):
+        rows = _split_rows(group)
+        w, g = parameter.detach()[rows], grad[rows]
+        torch.testing.assert_close(projected[rows], g - (w * g).sum() / w.square().sum() * w)
+
+
+def test_muon_ht_split_qkv_projection_differs_from_whole_matrix():
+    parameter = _qkv_parameter()
+    grad = torch.randn_like(parameter)
+    whole = _split_muon_h([parameter], optimizer_class=TensorParallelMuonHT, split_qkv=False)
+    projected = whole._project_gradient_to_tangent(parameter, grad)
+    assert _per_group_inner_products(parameter.detach(), projected).abs().max() > 1e-2
+
+
+def test_muon_ht_split_qkv_step_preserves_each_group_norm():
+    parameter = _qkv_parameter()
+    optimizer = _split_muon_h(
+        [parameter], optimizer_class=TensorParallelMuonHT, momentum=0.95, nesterov=True
+    )
+    before = _group_norms(parameter.detach())
+    for _ in range(3):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    torch.testing.assert_close(_group_norms(parameter.detach()), before, rtol=1e-5, atol=0)
+
+
 @pytest.mark.skipif(
     int(os.getenv("WORLD_SIZE", "1")) < 4, reason="Combined TP/GTP test requires at least 4 ranks"
 )

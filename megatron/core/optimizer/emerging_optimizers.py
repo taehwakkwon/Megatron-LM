@@ -835,18 +835,34 @@ class TensorParallelMuonHT(TensorParallelMuonH):
     """
 
     def _project_gradient_to_tangent(self, p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
-        """Return the global Frobenius-sphere tangent projection of ``grad``."""
-        weight_squared_norm = logical_frobenius_inner_product(p, p, p, self.pg_collection)
-        weight_gradient_inner_product = logical_frobenius_inner_product(
-            p, grad, p, self.pg_collection
-        )
+        """Return the tangent projection of ``grad`` onto each sphere ``p`` lives on.
+
+        That is the whole-matrix Frobenius sphere, or one sphere per QKV split group when
+        Hyperball follows the Newton-Schulz split (see :meth:`_split_groups`).
+        """
+        groups = self._split_groups(p)
+        if groups is None:
+            weight_squared_norm = logical_frobenius_inner_product(p, p, p, self.pg_collection)
+            weight_gradient_inner_product = logical_frobenius_inner_product(
+                p, grad, p, self.pg_collection
+            )
+        else:
+            index, num_groups = groups
+            weight_squared_norm = logical_group_frobenius_inner_product(
+                p, p, p, index, num_groups, self.pg_collection
+            )
+            weight_gradient_inner_product = logical_group_frobenius_inner_product(
+                p, grad, p, index, num_groups, self.pg_collection
+            )
         squared_eps = self.hyperball_eps * self.hyperball_eps
         projection_scale = torch.where(
             weight_squared_norm < squared_eps,
             torch.zeros_like(weight_gradient_inner_product),
             weight_gradient_inner_product / weight_squared_norm.clamp_min(squared_eps),
         )
-        return grad - p.to(dtype=grad.dtype) * projection_scale.to(dtype=grad.dtype)
+        projection = p.to(dtype=grad.dtype, copy=True)
+        self._scale_inplace(projection, p, projection_scale)
+        return grad - projection
 
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
