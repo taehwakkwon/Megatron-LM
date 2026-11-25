@@ -205,9 +205,7 @@ def logical_split_group_index(
     gtp_size, gtp_rank = 1, 0
     if getattr(param, "is_gtp_weight_remat", False):
         group = (
-            pg_collection.expt_gtp_remat
-            if _is_expert_parameter(param)
-            else pg_collection.gtp_remat
+            pg_collection.expt_gtp_remat if _is_expert_parameter(param) else pg_collection.gtp_remat
         )
         if group is None:
             raise RuntimeError("Muon Hyperball is missing the parameter's GTP-remat group")
